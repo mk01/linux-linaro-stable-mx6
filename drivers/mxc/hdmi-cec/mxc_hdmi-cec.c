@@ -69,12 +69,11 @@ struct hdmi_cec_event {
 
 static LIST_HEAD(head);
 
+static int hdmi_cec_ready = 0;
 static int hdmi_cec_major;
 static struct class *hdmi_cec_class;
 static struct hdmi_cec_priv hdmi_cec_data;
 static u8 open_count;
-
-static bool hdmi_cable;
 
 static wait_queue_head_t hdmi_cec_queue;
 static irqreturn_t mxc_hdmi_cec_isr(int irq, void *data)
@@ -113,16 +112,11 @@ void mxc_hdmi_cec_handle(u16 cec_stat)
 	u8 i = 0;
 	struct hdmi_cec_event *event = NULL;
 
-	pr_debug("function: %s \n", __func__);
 	if (!open_count)
 		return;
 
-	/* The current transmission is successful (for initiator only). */
-	/* A frame is not acknowledged in a directly addressed message.
-	 * Or a frame is negatively acknowledged in
-	 * a broadcast message (for initiator only).
-	 */
-	if (cec_stat & (HDMI_IH_CEC_STAT0_DONE | HDMI_IH_CEC_STAT0_NACK)) {
+	/* The current transmission is successful (for initiator only).*/
+	if (cec_stat & HDMI_IH_CEC_STAT0_DONE) {
 
 		event = vmalloc(sizeof(struct hdmi_cec_event));
 		if (NULL == event) {
@@ -136,21 +130,16 @@ void mxc_hdmi_cec_handle(u16 cec_stat)
 		for (i = 0; i < event->msg_len; i++)
 			event->msg[i] = hdmi_cec_data.last_msg[i];
 
-		event->event_type = (cec_stat & HDMI_IH_CEC_STAT0_DONE) ? 
-			MESSAGE_TYPE_SEND_SUCCESS : MESSAGE_TYPE_NOACK;
+		event->event_type = MESSAGE_TYPE_SEND_SUCCESS;
 
 		list_add_tail(&event->list, &head);
 		mutex_unlock(&hdmi_cec_data.lock);
 
 		wake_up(&hdmi_cec_queue);
 	}
-
-	/* EOM is detected so that the received data is ready
-	 * in the receiver data buffer
-	 */
-	if (cec_stat & HDMI_IH_CEC_STAT0_EOM) {
-
-		hdmi_writeb(0x02, HDMI_IH_CEC_STAT0);
+	/*A frame is not acknowledged in a directly addressed message. Or a frame is negatively acknowledged in
+	a broadcast message (for initiator only).*/
+	if (cec_stat & HDMI_IH_CEC_STAT0_NACK) {
 
 		event = vmalloc(sizeof(struct hdmi_cec_event));
 		if (NULL == event) {
@@ -159,70 +148,78 @@ void mxc_hdmi_cec_handle(u16 cec_stat)
 		}
 		memset(event, 0, sizeof(struct hdmi_cec_event));
 
+		mutex_lock(&hdmi_cec_data.lock);
+		event->msg_len = min((int)hdmi_cec_data.msg_len, 2);
+		for (i = 0; i < event->msg_len; i++)
+			event->msg[i] = hdmi_cec_data.last_msg[i];
+
+		event->event_type = MESSAGE_TYPE_NOACK;
+
+		list_add_tail(&event->list, &head);
+		mutex_unlock(&hdmi_cec_data.lock);
+
+		wake_up(&hdmi_cec_queue);
+	}
+	/*EOM is detected so that the received data is ready in the receiver data buffer*/
+	if (cec_stat & HDMI_IH_CEC_STAT0_EOM) {
+		event = vmalloc(sizeof(struct hdmi_cec_event));
+		if (NULL == event) {
+			pr_err("%s: Not enough memory!\n", __func__);
+			return;
+		}
+		memset(event, 0, sizeof(struct hdmi_cec_event));
 		event->msg_len = hdmi_readb(HDMI_CEC_RX_CNT);
 		if (!event->msg_len) {
 			pr_err("%s: Invalid CEC message length!\n", __func__);
 			return;
 		}
 		event->event_type = MESSAGE_TYPE_RECEIVE_SUCCESS;
-
 		for (i = 0; i < event->msg_len; i++)
 			event->msg[i] = hdmi_readb(HDMI_CEC_RX_DATA0+i);
 		hdmi_writeb(0x0, HDMI_CEC_LOCK);
-
+		mutex_lock(&hdmi_cec_data.lock);
 		list_add_tail(&event->list, &head);
-
+		mutex_unlock(&hdmi_cec_data.lock);
 		wake_up(&hdmi_cec_queue);
 	}
-
-	/* An error is detected on cec line (for initiator only). */
+	/*An error is detected on cec line (for initiator only). */
 	if (cec_stat & HDMI_IH_CEC_STAT0_ERROR_INIT) {
 		hdmi_cec_data.send_error++;
 	}
-
-	/* An error is notified by a follower.
-	 * Abnormal logic data bit error (for follower).
-	 */
+	/*An error is notified by a follower. Abnormal logic data bit error (for follower).*/
 	if (cec_stat & HDMI_IH_CEC_STAT0_ERROR_FOLL) {
 		hdmi_cec_data.receive_error++;
 	}
-
-	/* HDMI cable connected */
-	/* HDMI cable disconnected */
+	/* HDMI cable connected / HDMI cable disconnected */
 	if (cec_stat & (0x80 | 0x100)) {
+		mutex_lock(&hdmi_cec_data.lock);
+		hdmi_cec_data.write_busy = (cec_stat & 0x80) ? false : true;
+		mutex_unlock(&hdmi_cec_data.lock);
 		event = vmalloc(sizeof(struct hdmi_cec_event));
 		if (NULL == event) {
 			pr_err("%s: Not enough memory!\n", __func__);
 			return;
 		}
 		memset(event, 0, sizeof(struct hdmi_cec_event));
-		event->event_type = (cec_stat & 0x80) ? 
+		event->event_type = (cec_stat & 0x80) ?
 			MESSAGE_TYPE_CONNECTED : MESSAGE_TYPE_DISCONNECTED;
-
-		hdmi_cable = (cec_stat & 0x80) ? true : false;
 		list_add_tail(&event->list, &head);
-
 		wake_up(&hdmi_cec_queue);
 	}
 
     return;
 }
 EXPORT_SYMBOL(mxc_hdmi_cec_handle);
-
 static void mxc_hdmi_cec_worker(struct work_struct *work)
 {
 	u8 val;
-
-	if (hdmi_cec_data.latest_cec_stat)
-		mxc_hdmi_cec_handle(hdmi_cec_data.latest_cec_stat);
-
-	val = HDMI_IH_CEC_STAT0_WAKEUP | HDMI_IH_CEC_STAT0_ERROR_FOLL |
-			HDMI_IH_CEC_STAT0_ARB_LOST;
+	mxc_hdmi_cec_handle(hdmi_cec_data.latest_cec_stat);
+	val = HDMI_IH_CEC_STAT0_WAKEUP | HDMI_IH_CEC_STAT0_ERROR_FOLL | HDMI_IH_CEC_STAT0_ARB_LOST;
 	hdmi_writeb(val, HDMI_IH_MUTE_CEC_STAT0);
 }
 
 /*!
- * @brief open function for vpu file operation
+ * @brief open function for cec file operation
  *
  * @return  0 on success or negative error code on error
  */
@@ -233,13 +230,11 @@ static int hdmi_cec_open(struct inode *inode, struct file *filp)
 		mutex_unlock(&hdmi_cec_data.lock);
 		return -EBUSY;
 	}
-
 	open_count = 1;
 	filp->private_data = (void *)(&hdmi_cec_data);
 	hdmi_cec_data.Logical_address = 15;
 	hdmi_cec_data.cec_state = false;
 	mutex_unlock(&hdmi_cec_data.lock);
-
 	return 0;
 }
 
@@ -256,7 +251,7 @@ static ssize_t hdmi_cec_read(struct file *file, char __user *buf, size_t count,
 	count = min(count, sizeof(struct hdmi_cec_event) - sizeof(struct list_head));
 
 	do {
-		unsigned long flags;    
+		unsigned long flags;
 		struct hdmi_cec_event *event = NULL;
 
 		spin_lock_irqsave(&hdmi_cec->irq_lock, flags);
@@ -300,19 +295,14 @@ static ssize_t hdmi_cec_write(struct file *file, const char __user *buf,
 	if (copy_from_user(&msg, buf, count))
 		return -EFAULT;
 
-	do {
-		if (file->f_flags & O_NONBLOCK) {
-			if (hdmi_cec->write_busy)
-				ret = -EAGAIN;
-		} else if (wait_event_interruptible(hdmi_cec_queue, (!hdmi_cec->write_busy))) {
-				ret = -ERESTARTSYS;
-		}
-		if (ret)
-			break;
-		
-		mutex_lock(&hdmi_cec->lock);
-		hdmi_cec->write_busy = true;
+	if (file->f_flags & O_NONBLOCK && hdmi_cec->write_busy)
+		return -EAGAIN;
+	else if (wait_event_interruptible(hdmi_cec_queue, (!hdmi_cec->write_busy)))
+		return -ERESTARTSYS;
 
+	mutex_lock(&hdmi_cec->lock);
+	hdmi_cec->write_busy = true;
+	do {
 		hdmi_cec->send_error = 0;
 		hdmi_writeb(count, HDMI_CEC_TX_CNT);
 		for (i = 0; i < count; i++) {
@@ -325,10 +315,11 @@ static ssize_t hdmi_cec_write(struct file *file, const char __user *buf,
 		memcpy(hdmi_cec->last_msg, msg, count);
 		hdmi_cec->msg_len = count;
 
-		for (i = 0; i++ < 60 && (hdmi_readb(HDMI_CEC_CTRL) & 0x01) && !hdmi_cec->send_error; msleep(50));
+		for (i = 0; i++ < 300 && (hdmi_readb(HDMI_CEC_CTRL) & 0x01) && !hdmi_cec->send_error; msleep(10));
 		if (hdmi_readb(HDMI_CEC_CTRL) & 0x01 || hdmi_cec->send_error) {
 			hdmi_cec->msg_len = 0;
 			hdmi_cec->send_error = 0;
+			hdmi_writeb(0x02, HDMI_CEC_CTRL);
 			ret = -EIO;
 		} else {
 			ret = count;
@@ -340,6 +331,80 @@ static ssize_t hdmi_cec_write(struct file *file, const char __user *buf,
 	return ret;
 }
 
+static void hdmi_cec_hwenable(void)
+{
+	u8 val;
+
+	if (!hdmi_cec_ready || hdmi_cec_data.cec_state)
+		return;
+
+	val = hdmi_readb(HDMI_MC_CLKDIS);
+	val &= ~HDMI_MC_CLKDIS_CECCLK_DISABLE;
+	hdmi_writeb(val, HDMI_MC_CLKDIS);
+
+	val = HDMI_IH_CEC_STAT0_ERROR_INIT | HDMI_IH_CEC_STAT0_NACK |
+		HDMI_IH_CEC_STAT0_EOM | HDMI_IH_CEC_STAT0_ERROR_FOLL | HDMI_IH_CEC_STAT0_DONE;
+	hdmi_writeb(val, HDMI_CEC_POLARITY);
+
+	val = HDMI_IH_CEC_STAT0_WAKEUP |
+		HDMI_IH_CEC_STAT0_ARB_LOST;
+	hdmi_writeb(val, HDMI_CEC_MASK);
+	hdmi_writeb(val, HDMI_IH_MUTE_CEC_STAT0);
+
+	hdmi_writeb(0x02, HDMI_CEC_CTRL);
+	hdmi_writeb(0x0, HDMI_CEC_LOCK);
+
+	mutex_lock(&hdmi_cec_data.lock);
+	hdmi_cec_data.cec_state = true;
+	mutex_unlock(&hdmi_cec_data.lock);
+}
+
+static void hdmi_cec_hwdisable(void)
+{
+	u8 val;
+
+	if(!hdmi_cec_ready || !hdmi_cec_data.cec_state)
+		return;
+
+	val = HDMI_IH_CEC_STAT0_WAKEUP | HDMI_IH_CEC_STAT0_ERROR_FOLL |
+		HDMI_IH_CEC_STAT0_ERROR_INIT | HDMI_IH_CEC_STAT0_ARB_LOST |
+		HDMI_IH_CEC_STAT0_NACK | HDMI_IH_CEC_STAT0_EOM |
+		HDMI_IH_CEC_STAT0_DONE;
+	hdmi_writeb(val, HDMI_CEC_MASK);
+	hdmi_writeb(val, HDMI_IH_MUTE_CEC_STAT0);
+
+	hdmi_writeb(0x0, HDMI_CEC_POLARITY);
+
+	hdmi_writeb(0x10, HDMI_CEC_CTRL);
+
+	val = hdmi_readb(HDMI_MC_CLKDIS);
+	val |= HDMI_MC_CLKDIS_CECCLK_DISABLE;
+	hdmi_writeb(val, HDMI_MC_CLKDIS);
+
+	mutex_lock(&hdmi_cec_data.lock);
+	hdmi_cec_data.cec_state = false;
+	mutex_unlock(&hdmi_cec_data.lock);
+}
+
+static long hdmi_cec_set_address(u_long arg)
+{
+	u8 val;
+
+	if (arg <= 7) {
+		val = 1 << (u8)arg;
+		hdmi_writeb(val, HDMI_CEC_ADDR_L);
+		hdmi_writeb(0, HDMI_CEC_ADDR_H);
+	} else if (arg <= 15) {
+		val = 1 << ((u8)arg - 8);
+		hdmi_writeb(val, HDMI_CEC_ADDR_H);
+		hdmi_writeb(0, HDMI_CEC_ADDR_L);
+	} else
+		return -EINVAL;
+
+	hdmi_cec_data.Logical_address = (u8)arg;
+	return 0;
+}
+
 /*!
  * @brief IO ctrl function for vpu file operation
  * @param cmd IO ctrl command
@@ -349,7 +414,6 @@ static long hdmi_cec_ioctl(struct file *filp, u_int cmd,
 		     u_long arg)
 {
 	int ret = 0;
-	u8 val = 0;
 	struct mxc_edid_cfg hdmi_edid_cfg;
 
 	pr_debug("function : %s\n", __func__);
@@ -361,66 +425,20 @@ static long hdmi_cec_ioctl(struct file *filp, u_int cmd,
 		mutex_lock(&hdmi_cec_data.lock);
 		if (false == hdmi_cec_data.cec_state) {
 			mutex_unlock(&hdmi_cec_data.lock);
+			pr_err("Trying to set logical address while not started\n");
 			return -EACCES;
 		}
 
-		hdmi_cec_data.Logical_address = (u8)arg;
-
-		if (hdmi_cec_data.Logical_address <= 7) {
-			val = 1 << hdmi_cec_data.Logical_address;
-			hdmi_writeb(val, HDMI_CEC_ADDR_L);
-			hdmi_writeb(0, HDMI_CEC_ADDR_H);
-		} else if (hdmi_cec_data.Logical_address <= 15) {
-			val = 1 << (hdmi_cec_data.Logical_address - 8);
-			hdmi_writeb(val, HDMI_CEC_ADDR_H);
-			hdmi_writeb(0, HDMI_CEC_ADDR_L);
-		} else {
-			ret = -EINVAL;
-		}
-
+		hdmi_cec_set_address(arg);
 		mutex_unlock(&hdmi_cec_data.lock);
 		break;
 
 	case HDMICEC_IOC_STARTDEVICE:
-		val = hdmi_readb(HDMI_MC_CLKDIS);
-		val &= ~HDMI_MC_CLKDIS_CECCLK_DISABLE;
-		hdmi_writeb(val, HDMI_MC_CLKDIS);
-
-		val = HDMI_IH_CEC_STAT0_ERROR_INIT | HDMI_IH_CEC_STAT0_NACK |
-			HDMI_IH_CEC_STAT0_EOM | HDMI_IH_CEC_STAT0_DONE;
-		hdmi_writeb(val, HDMI_CEC_POLARITY);
-
-		val = HDMI_IH_CEC_STAT0_WAKEUP | HDMI_IH_CEC_STAT0_ERROR_FOLL |
-			HDMI_IH_CEC_STAT0_ARB_LOST;
-		hdmi_writeb(val, HDMI_CEC_MASK);
-		hdmi_writeb(val, HDMI_IH_MUTE_CEC_STAT0);
-
-		hdmi_writeb(0x02, HDMI_CEC_CTRL);
-
-		mutex_lock(&hdmi_cec_data.lock);
-		hdmi_cec_data.cec_state = true;
-		mutex_unlock(&hdmi_cec_data.lock);
+		hdmi_cec_hwenable();
 		break;
 
 	case HDMICEC_IOC_STOPDEVICE:
-		hdmi_writeb(0x10, HDMI_CEC_CTRL);
-
-		val = HDMI_IH_CEC_STAT0_WAKEUP | HDMI_IH_CEC_STAT0_ERROR_FOLL |
-			HDMI_IH_CEC_STAT0_ERROR_INIT | HDMI_IH_CEC_STAT0_ARB_LOST |
-			HDMI_IH_CEC_STAT0_NACK | HDMI_IH_CEC_STAT0_EOM |
-			HDMI_IH_CEC_STAT0_DONE;
-		hdmi_writeb(val, HDMI_CEC_MASK);
-		hdmi_writeb(val, HDMI_IH_MUTE_CEC_STAT0);
-
-		hdmi_writeb(0x0, HDMI_CEC_POLARITY);
-
-		val = hdmi_readb(HDMI_MC_CLKDIS);
-		val |= HDMI_MC_CLKDIS_CECCLK_DISABLE;
-		hdmi_writeb(val, HDMI_MC_CLKDIS);
-
-		mutex_lock(&hdmi_cec_data.lock);
-		hdmi_cec_data.cec_state = false;
-		mutex_unlock(&hdmi_cec_data.lock);
+		hdmi_cec_hwdisable();
 		break;
 
 	case HDMICEC_IOC_GETPHYADDRESS:
@@ -438,25 +456,34 @@ static long hdmi_cec_ioctl(struct file *filp, u_int cmd,
 	return ret;
 }
 
+void hdmi_cec_start_device(void)
+{
+	hdmi_cec_ready = 1;
+	if(open_count)
+		hdmi_cec_hwenable();
+}
+EXPORT_SYMBOL(hdmi_cec_start_device);
+
+void hdmi_cec_stop_device(void)
+{
+	if(open_count)
+		hdmi_cec_hwenable();
+	hdmi_cec_ready = 0;
+}
+EXPORT_SYMBOL(hdmi_cec_stop_device);
+
 /*!
 * @brief Release function for vpu file operation
 * @return  0 on success or negative error code on error
 */
 static int hdmi_cec_release(struct inode *inode, struct file *filp)
 {
-	struct hdmi_cec_priv *hdmi_cec = filp->private_data;
-
-	pr_debug("function : %s\n", __func__);
-
-	if (hdmi_cec->cec_state)
-		hdmi_cec_ioctl(filp, HDMICEC_IOC_STOPDEVICE, 0);
-
-	mutex_lock(&hdmi_cec->lock);
+	hdmi_cec_hwdisable();
+	mutex_lock(&hdmi_cec_data.lock);
 	if (open_count) {
-		hdmi_cec_data.Logical_address = 15;
-
-		if (!(wait_event_timeout(hdmi_cec_queue, !hdmi_cec->write_busy, msecs_to_jiffies(500))))
-			hdmi_cec->write_busy = false;
+		hdmi_cec_set_address(15);
+		if (!(wait_event_timeout(hdmi_cec_queue, !hdmi_cec_data.write_busy, msecs_to_jiffies(500))))
+			hdmi_cec_data.write_busy = false;
 
 		while (!list_empty(&head)) {
 			struct hdmi_cec_event *event;
@@ -467,7 +494,7 @@ static int hdmi_cec_release(struct inode *inode, struct file *filp)
 		}
 		open_count = 0;
 	}
-	mutex_unlock(&hdmi_cec->lock);
+	mutex_unlock(&hdmi_cec_data.lock);
 	return 0;
 }
 
@@ -479,7 +506,7 @@ static unsigned int hdmi_cec_poll(struct file *file, poll_table *wait)
 
 	poll_wait(file, &hdmi_cec_queue, wait);
 
-	if (!hdmi_cec_data.write_busy && hdmi_cable)
+	if (!hdmi_cec_data.write_busy)
 		mask = (POLLOUT | POLLWRNORM);
 	if (!list_empty(&head))
 		mask |= (POLLIN | POLLRDNORM);
@@ -505,8 +532,7 @@ static int hdmi_cec_dev_probe(struct platform_device *pdev)
 	struct pinctrl *pinctrl;
 	int irq = platform_get_irq(pdev, 0);
 
-	hdmi_cec_major = register_chrdev(hdmi_cec_major,
-				"mxc_hdmi_cec", &hdmi_cec_fops);
+	hdmi_cec_major = register_chrdev(hdmi_cec_major, "mxc_hdmi_cec", &hdmi_cec_fops);
 	if (hdmi_cec_major < 0) {
 		dev_err(&pdev->dev, "hdmi_cec: unable to get a major for HDMI CEC\n");
 		err = -EBUSY;
@@ -518,7 +544,6 @@ static int hdmi_cec_dev_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "hdmi_cec:No HDMI irq line provided\n");
 		goto err_out_chrdev;
 	}
-
 	spin_lock_init(&hdmi_cec_data.irq_lock);
 
 	err = devm_request_irq(&pdev->dev, irq, mxc_hdmi_cec_isr, IRQF_SHARED,
@@ -552,16 +577,13 @@ static int hdmi_cec_dev_probe(struct platform_device *pdev)
 	INIT_LIST_HEAD(&head);
 
 	mutex_init(&hdmi_cec_data.lock);
-
 	hdmi_cec_data.Logical_address = 15;
-
+	hdmi_cec_data.cec_state = false;
 	platform_set_drvdata(pdev, &hdmi_cec_data);
-
 	INIT_DELAYED_WORK(&hdmi_cec_data.hdmi_cec_work, mxc_hdmi_cec_worker);
 
-	hdmi_cable = true;
-
 	dev_info(&pdev->dev, "HDMI CEC initialized\n");
+	hdmi_cec_ready = 1;
 	goto out;
 
 err_out_class:

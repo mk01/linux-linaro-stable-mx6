@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2011-2013 Freescale Semiconductor, Inc.
+ * Copyright (C) 2011-2014 Freescale Semiconductor, Inc.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -39,7 +39,6 @@
 #include <linux/mfd/mxc-hdmi-core.h>
 #include <linux/of_device.h>
 #include <linux/mod_devicetable.h>
-#include <linux/mfd/mxc-hdmi-core.h>
 
 struct mxc_hdmi_data {
 	struct platform_device *pdev;
@@ -59,13 +58,28 @@ static struct clk *pixel_clk;
 static int hdmi_ratio;
 int mxc_hdmi_ipu_id;
 int mxc_hdmi_disp_id;
+static int hdmi_core_edid_status;
 static struct mxc_edid_cfg hdmi_core_edid_cfg;
 static int hdmi_core_init;
 static unsigned int hdmi_dma_running;
 static struct snd_pcm_substream *hdmi_audio_stream_playback;
 static unsigned int hdmi_cable_state;
 static unsigned int hdmi_blank_state;
+static unsigned int hdmi_abort_state;
 static spinlock_t hdmi_audio_lock, hdmi_blank_state_lock, hdmi_cable_state_lock;
+
+void hdmi_set_dvi_mode(unsigned int state)
+{
+	if (state) {
+		mxc_hdmi_abort_stream();
+#ifdef CONFIG_MXC_HDMI_CEC
+		hdmi_cec_stop_device();
+	} else {
+		hdmi_cec_start_device();
+#endif
+	}
+}
+EXPORT_SYMBOL(hdmi_set_dvi_mode);
 
 unsigned int hdmi_set_cable_state(unsigned int state)
 {
@@ -76,8 +90,10 @@ unsigned int hdmi_set_cable_state(unsigned int state)
 	hdmi_cable_state = state;
 	spin_unlock_irqrestore(&hdmi_cable_state_lock, flags);
 
-	if (check_hdmi_state() && substream)
+	if (check_hdmi_state() && substream && hdmi_abort_state) {
+		hdmi_abort_state = 0;
 		substream->ops->trigger(substream, SNDRV_PCM_TRIGGER_START);
+	}
 	return 0;
 }
 EXPORT_SYMBOL(hdmi_set_cable_state);
@@ -91,9 +107,10 @@ unsigned int hdmi_set_blank_state(unsigned int state)
 	hdmi_blank_state = state;
 	spin_unlock_irqrestore(&hdmi_blank_state_lock, flags);
 
-	if (check_hdmi_state() && substream)
+	if (check_hdmi_state() && substream && hdmi_abort_state) {
+		hdmi_abort_state = 0;
 		substream->ops->trigger(substream, SNDRV_PCM_TRIGGER_START);
-
+	}
 	return 0;
 }
 EXPORT_SYMBOL(hdmi_set_blank_state);
@@ -104,8 +121,10 @@ static void hdmi_audio_abort_stream(struct snd_pcm_substream *substream)
 
 	snd_pcm_stream_lock_irqsave(substream, flags);
 
-	if (snd_pcm_running(substream))
+	if (snd_pcm_running(substream)) {
+		hdmi_abort_state = 1;
 		substream->ops->trigger(substream, SNDRV_PCM_TRIGGER_STOP);
+	}
 
 	snd_pcm_stream_unlock_irqrestore(substream, flags);
 }
@@ -153,6 +172,7 @@ int mxc_hdmi_register_audio(struct snd_pcm_substream *substream)
 			ret = -EINVAL;
 		}
 		hdmi_audio_stream_playback = substream;
+		hdmi_abort_state = 0;
 		spin_unlock_irqrestore(&hdmi_audio_lock, flags1);
 	} else
 		ret = -EINVAL;
@@ -169,6 +189,7 @@ void mxc_hdmi_unregister_audio(struct snd_pcm_substream *substream)
 
 	spin_lock_irqsave(&hdmi_audio_lock, flags);
 	hdmi_audio_stream_playback = NULL;
+	hdmi_abort_state = 0;
 	spin_unlock_irqrestore(&hdmi_audio_lock, flags);
 }
 EXPORT_SYMBOL(mxc_hdmi_unregister_audio);
@@ -566,23 +587,26 @@ void hdmi_set_sample_rate(unsigned int rate)
 }
 EXPORT_SYMBOL(hdmi_set_sample_rate);
 
-void hdmi_set_edid_cfg(struct mxc_edid_cfg *cfg)
+void hdmi_set_edid_cfg(int edid_status, struct mxc_edid_cfg *cfg)
 {
 	unsigned long flags;
 
 	spin_lock_irqsave(&edid_spinlock, flags);
+	hdmi_core_edid_status = edid_status;
 	memcpy(&hdmi_core_edid_cfg, cfg, sizeof(struct mxc_edid_cfg));
 	spin_unlock_irqrestore(&edid_spinlock, flags);
 }
 EXPORT_SYMBOL(hdmi_set_edid_cfg);
 
-void hdmi_get_edid_cfg(struct mxc_edid_cfg *cfg)
+int hdmi_get_edid_cfg(struct mxc_edid_cfg *cfg)
 {
 	unsigned long flags;
 
 	spin_lock_irqsave(&edid_spinlock, flags);
 	memcpy(cfg, &hdmi_core_edid_cfg, sizeof(struct mxc_edid_cfg));
 	spin_unlock_irqrestore(&edid_spinlock, flags);
+
+	return hdmi_core_edid_status;
 }
 EXPORT_SYMBOL(hdmi_get_edid_cfg);
 
@@ -653,6 +677,7 @@ static int mxc_hdmi_core_probe(struct platform_device *pdev)
 
 	spin_lock_irqsave(&hdmi_audio_lock, flags);
 	hdmi_audio_stream_playback = NULL;
+	hdmi_abort_state = 0;
 	spin_unlock_irqrestore(&hdmi_audio_lock, flags);
 
 	isfr_clk = clk_get(&hdmi_data->pdev->dev, "hdmi_isfr");
