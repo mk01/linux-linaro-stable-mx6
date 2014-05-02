@@ -2038,10 +2038,10 @@ static void hotplug_worker(struct work_struct *work)
 	if (hdmi->latest_intr_stat & hdmi->plug_event) {
 		/* Make HPD intr active low to capture unplug event or
 		 * active high to capture plugin event */
-		hdmi_writeb((HDMI_DVI_STAT & ~hdmi_phy_stat0), HDMI_PHY_POL0);
+		hdmi_writeb((hdmi->plug_mask & ~hdmi_phy_pol0), HDMI_PHY_POL0);
 
 		/* check cable status */
-		if (hdmi_phy_pol0 & HDMI_DVI_STAT) {
+		if (hdmi_phy_pol0 & hdmi->plug_mask) {
 			/* Plugin event */
 			dev_dbg(&hdmi->pdev->dev, "EVENT=plugin\n");
 			mxc_hdmi_cable_connected(hdmi);
