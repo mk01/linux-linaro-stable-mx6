@@ -286,7 +286,6 @@ static ssize_t hdmi_cec_read(struct file *file, char __user *buf, size_t count,
 			list_del(&event->list);
 		}
 		spin_unlock_irqrestore(&hdmi_cec->irq_lock, flags);
-		wake_up(&hdmi_cec_queue);
 
 		if (event) {
 			ret = copy_to_user(buf, event, count) ? -EFAULT : count;
@@ -347,9 +346,8 @@ static ssize_t hdmi_cec_write(struct file *file, const char __user *buf,
 		memcpy(hdmi_cec->last_msg, msg, count);
 		hdmi_cec->msg_len = count;
 
-		mutex_unlock(&hdmi_cec->lock);
-
-		if (!(wait_event_timeout(hdmi_cec_queue, (!(hdmi_readb(HDMI_CEC_CTRL) & 0x01)), msecs_to_jiffies(500)))) {
+		for (i = 0; i++ < 6 && (hdmi_readb(HDMI_CEC_CTRL) & 0x01); msleep(50));
+		if (hdmi_readb(HDMI_CEC_CTRL) & 0x01) {
 			hdmi_cec->msg_len = 0;
 			ret = -EIO;
 		} else {
@@ -358,6 +356,7 @@ static ssize_t hdmi_cec_write(struct file *file, const char __user *buf,
 	} while(!ret);
 
 	hdmi_cec->write_busy = false;
+	mutex_unlock(&hdmi_cec->lock);
 	return ret;
 }
 
@@ -510,12 +509,10 @@ static unsigned int hdmi_cec_poll(struct file *file, poll_table *wait)
 
 	poll_wait(file, &hdmi_cec_queue, wait);
 
-	mutex_lock(&hdmi_cec_data.lock);
 	if (!hdmi_cec_data.write_busy) 
 		mask = (POLLOUT | POLLWRNORM);
 	if (!list_empty(&head))
 		mask |= (POLLIN | POLLRDNORM);
-	mutex_unlock(&hdmi_cec_data.lock);
 
 	return mask;
 }
